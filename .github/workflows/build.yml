@@ -1,192 +1,21 @@
-name: Build Melodix APK
-
-
-
-on:
-
-push:
-
-branches: [ main, master ]
-
-tags: [ 'v*' ]
-
-workflow_dispatch:
-
-
-
-permissions:
-
-contents: write
-
-
-
-concurrency:
-
-group: build-${{ github.ref }}
-
-cancel-in-progress: true
-
-
-
-jobs:
-
-build:
-
-runs-on: ubuntu-latest
-
-timeout-minutes: 60
-
-
-
-steps:
-
-- name: Checkout
-
-uses: actions/checkout@v4
-
-
-
-# Одноразово: распаковка проекта из Melodix.zip в корень репозитория
-
-- name: Unpack project from Melodix.zip
-
-if: hashFiles('Melodix.zip') != ''
-
-run: |
-
-unzip -q Melodix.zip -d /tmp/unz
-
-rm -rf /tmp/unz/Melodix/.github
-
-cp -a /tmp/unz/Melodix/. .
-
-git rm -q Melodix.zip
-
-git config user.name "melodix-ci"
-
-git config user.email "melodix-ci@users.noreply.github.com"
-
-git add -A
-
-git commit -m "Unpack project sources from Melodix.zip [skip ci]"
-
-git push
-
-
-
-- name: Set up JDK 17
-
-uses: actions/setup-java@v5
-
-with:
-
-distribution: temurin
-
-java-version: '17'
-
-
-
-- name: Set up Gradle
-
-uses: gradle/actions/setup-gradle@v4
-
-with:
-
-gradle-version: '8.10.2'
-
-
-
-# Нейросеть для разделения вокала/инструментала (UVR MDX-Net Inst HQ3, ~64 МБ)
-
-- name: Download separation model
-
-run: |
-
-mkdir -p app/src/main/assets/models
-
-curl -fL --retry 5 --retry-delay 5 \
-
--o app/src/main/assets/models/UVR-MDX-NET-Inst_HQ_3.onnx \
-
-https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_3.onnx \
-
-|| echo "::warning::Model download failed"
-
-ls -la app/src/main/assets/models
-
-
-
-- name: Build release APK
-
-run: gradle --no-daemon --stacktrace assembleRelease 2>&1 | tee build.log
-
-
-
-- name: Rename APK
-
-run: |
-
-mkdir -p out
-
-cp app/build/outputs/apk/release/*.apk out/Melodix-${{ github.run_number }}.apk
-
-ls -la out
-
-
-
-- name: Upload APK artifact
-
-uses: actions/upload-artifact@v4
-
-with:
-
-name: Melodix-apk
-
-path: out/*.apk
-
-
-
-- name: Publish GitHub Release (only for tags v*)
-
-if: startsWith(github.ref, 'refs/tags/v')
-
-uses: softprops/action-gh-release@v2
-
-with:
-
-files: out/*.apk
-
-
-
-# Отчёт о сборке в ветку ci-logs (для диагностики ошибок)
-
-- name: Publish build report
-
-if: always()
-
-run: |
-
-mkdir -p /tmp/ci && cd /tmp/ci
-
-echo "status=${{ job.status }} run=${{ github.run_number }} sha=${{ github.sha }}" > status.txt
-
-if [ -f "$GITHUB_WORKSPACE/build.log" ]; then
-
-grep -E "^e: |error:|ERROR|FAILURE|What went wrong|Could not|BUILD " -A4 "$GITHUB_WORKSPACE/build.log" | head -400 > errors.txt || true
-
-tail -250 "$GITHUB_WORKSPACE/build.log" > tail.txt
-
-fi
-
-ls -la "$GITHUB_WORKSPACE/out" > apk.txt 2>&1 || true
-
-git init -q
-
-git checkout -q -b ci-logs
-
-git add .
-
-git -c user.name=melodix-ci -c user.email=melodix-ci@users.noreply.github.com commit -qm "report ${{ github.run_number }}"
-
-git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ci-logs
-
+{
+ "name": "Build Melodix APK",
+ "on": {"push": {"branches": ["main", "master"], "tags": ["v*"]}, "workflow_dispatch": null},
+ "permissions": {"contents": "write"},
+ "concurrency": {"group": "build-${{ github.ref }}", "cancel-in-progress": true},
+ "jobs": {"build": {"runs-on": "ubuntu-latest", "timeout-minutes": 60, "steps": [
+  {"name": "Checkout", "uses": "actions/checkout@v4"},
+  {"name": "Unpack project from Melodix.zip", "if": "hashFiles('Melodix.zip') != ''",
+   "run": "unzip -q Melodix.zip -d /tmp/unz\nrm -rf /tmp/unz/Melodix/.github\ncp -a /tmp/unz/Melodix/. .\ngit rm -q Melodix.zip\ngit config user.name \"melodix-ci\"\ngit config user.email \"melodix-ci@users.noreply.github.com\"\ngit add -A\ngit commit -m \"Unpack project sources from Melodix.zip [skip ci]\"\ngit push\n"},
+  {"name": "Set up JDK 17", "uses": "actions/setup-java@v5", "with": {"distribution": "temurin", "java-version": "17"}},
+  {"name": "Set up Gradle", "uses": "gradle/actions/setup-gradle@v4", "with": {"gradle-version": "8.10.2"}},
+  {"name": "Download separation model",
+   "run": "mkdir -p app/src/main/assets/models\ncurl -fL --retry 5 --retry-delay 5 -o app/src/main/assets/models/UVR-MDX-NET-Inst_HQ_3.onnx https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_3.onnx || echo \"::warning::Model download failed\"\nls -la app/src/main/assets/models\n"},
+  {"name": "Build release APK", "run": "gradle --no-daemon --stacktrace assembleRelease 2>&1 | tee build.log"},
+  {"name": "Rename APK", "run": "mkdir -p out\ncp app/build/outputs/apk/release/*.apk out/Melodix-${{ github.run_number }}.apk\nls -la out\n"},
+  {"name": "Upload APK artifact", "uses": "actions/upload-artifact@v4", "with": {"name": "Melodix-apk", "path": "out/*.apk"}},
+  {"name": "Publish GitHub Release (only for tags v*)", "if": "startsWith(github.ref, 'refs/tags/v')", "uses": "softprops/action-gh-release@v2", "with": {"files": "out/*.apk"}},
+  {"name": "Publish build report", "if": "always()",
+   "run": "mkdir -p /tmp/ci && cd /tmp/ci\necho \"status=${{ job.status }} run=${{ github.run_number }} sha=${{ github.sha }}\" > status.txt\nif [ -f \"$GITHUB_WORKSPACE/build.log\" ]; then\n  grep -E \"^e: |error:|ERROR|FAILURE|What went wrong|Could not|BUILD \" -A4 \"$GITHUB_WORKSPACE/build.log\" | head -400 > errors.txt || true\n  tail -250 \"$GITHUB_WORKSPACE/build.log\" > tail.txt\nfi\nls -la \"$GITHUB_WORKSPACE/out\" > apk.txt 2>&1 || true\ngit init -q\ngit checkout -q -b ci-logs\ngit add .\ngit -c user.name=melodix-ci -c user.email=melodix-ci@users.noreply.github.com commit -qm \"report ${{ github.run_number }}\"\ngit push -qf \"https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git\" ci-logs\n"}
+ ]}}
+}
