@@ -22,6 +22,9 @@ import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.pow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 
 // ===================================================================================
 //  Модели
@@ -104,10 +107,15 @@ object ModelManager {
 //  Параметры
 // ===================================================================================
 
+/**
+ * Перекрытие блоков нужно только для сглаживания стыков: края каждого блока (n_fft/2 сэмплов)
+ * и так отбрасываются, как в оригинальном UVR. Поэтому большое перекрытие почти ничего не даёт,
+ * а время умножает. Шумоподавление (второй проход с инверсией фазы) реально чистит остатки.
+ */
 enum class SepQuality(val label: String, val description: String, val overlap: Float, val denoise: Boolean) {
-    FAST("Быстро", "Без перекрытия блоков", 0f, false),
-    BALANCED("Баланс", "Перекрытие 50%, мягкие стыки", 0.5f, false),
-    BEST("Максимум", "Перекрытие 75% + шумоподавление (в ~8 раз дольше)", 0.75f, true),
+    FAST("Быстро", "Как в оригинальном UVR: без перекрытия, 1 проход", 0f, false),
+    BALANCED("Баланс", "Плавные стыки (перекрытие 12,5%), 1 проход", 0.125f, false),
+    BEST("Максимум", "Перекрытие 50% + шумоподавление, 2 прохода", 0.5f, true),
 }
 
 data class SepOptions(
@@ -116,104 +124,215 @@ data class SepOptions(
     val format: ExportFormat = ExportFormat.WAV,
     val bitrate: Int = 320_000,
     val dspStrength: Float = 0.7f,
+    val accelerate: Boolean = true,
 )
 
 /** Получатель «первичной» дорожки (до компенсации), потоково. */
 typealias StemSink = (start: Long, l: FloatArray, r: FloatArray, count: Int) -> Unit
 
 // ===================================================================================
-//  Нейросетевой движок MDX-Net (ONNX Runtime, CPU, полностью офлайн)
+//  Нейросетевой движок MDX-Net (ONNX Runtime: NPU / XNNPACK / CPU, полностью офлайн)
 // ===================================================================================
 
-class MdxEngine(modelFile: File, private val nFft: Int) : AutoCloseable {
+class MdxEngine(
+    private val ctx: Context,
+    private val model: ModelInfo,
+    private val modelFile: File,
+    private val accelerate: Boolean,
+) : AutoCloseable {
     private val env = OrtEnvironment.getEnvironment()
-    private val session: OrtSession
-    private val inputName: String
-    val dimF: Int
-    val dimT: Int
+    private var session: OrtSession? = null
+    private var inputName = "input"
+    var backend: Backend = Backend.CPU
+        private set
+    var dimF = 0
+        private set
+    var dimT = 0
+        private set
     private val hop = 1024
+    private val nFft = model.nFft
 
-    init {
-        val opts = OrtSession.SessionOptions()
-        opts.setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 8))
-        opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        session = env.createSession(modelFile.absolutePath, opts)
-        inputName = session.inputNames.first()
-        val shape = (session.inputInfo[inputName]!!.info as TensorInfo).shape
-        dimF = shape[2].toInt()
-        dimT = shape[3].toInt()
+    private fun bind(s: OrtSession, b: Backend) {
+        session?.close()
+        session = s; backend = b
+        inputName = s.inputNames.first()
+        val shape = (s.inputInfo[inputName]!!.info as TensorInfo).shape
+        dimF = shape[2].toInt(); dimT = shape[3].toInt()
         require(dimF > 0 && dimT > 0) { "Неподдерживаемая форма входа модели" }
         require(dimF <= nFft / 2 + 1) { "n_fft=$nFft слишком мал для модели (dim_f=$dimF)" }
     }
 
-    private fun infer(spec: FloatArray, out: FloatArray) {
+    private fun infer(s: OrtSession, name: String, dimF: Int, dimT: Int, spec: FloatArray, out: FloatArray) {
         OnnxTensor.createTensor(env, FloatBuffer.wrap(spec), longArrayOf(1, 4, dimF.toLong(), dimT.toLong())).use { t ->
-            session.run(mapOf(inputName to t)).use { res ->
-                val o = res.get(0) as OnnxTensor
-                o.floatBuffer.get(out)
+            s.run(mapOf(name to t)).use { res ->
+                (res.get(0) as OnnxTensor).floatBuffer.get(out)
             }
         }
     }
 
-    suspend fun process(mix: ShortArray, frames: Int, quality: SepQuality, job: JobScope, p0: Float, p1: Float, sink: StemSink) {
-        val chunk = hop * (dimT - 1)
-        val trim = nFft / 2
-        val gen = chunk - 2 * trim
-        require(gen > 0) { "Неверные параметры модели" }
-        val step = max(hop, (gen * (1f - quality.overlap)).toInt())
-        val ramp = gen - step
-        val taper = FloatArray(gen) { i ->
-            when {
-                ramp <= 0 -> 1f
-                i < ramp -> (0.5 - 0.5 * cos(PI * (i + 0.5) / ramp)).toFloat().coerceAtLeast(1e-3f)
-                i >= gen - ramp -> (0.5 - 0.5 * cos(PI * (gen - i - 0.5) / ramp)).toFloat().coerceAtLeast(1e-3f)
-                else -> 1f
-            }
-        }
-        val stft = MdxStft(nFft, hop, dimF, dimT)
-        val plane = dimF * dimT
-        val spec = FloatArray(4 * plane)
-        val pred = FloatArray(4 * plane)
-        val neg = if (quality.denoise) FloatArray(4 * plane) else FloatArray(0)
-        val inL = FloatArray(chunk); val inR = FloatArray(chunk)
-        val outL = FloatArray(chunk); val outR = FloatArray(chunk)
-        val segL = FloatArray(gen); val segR = FloatArray(gen)
+    private fun infer(spec: FloatArray, out: FloatArray) = infer(session!!, inputName, dimF, dimT, spec, out)
 
-        val acc = OverlapAccumulator(gen, frames.toLong(), 0L, sink)
-        val total = ceil(frames.toDouble() / step).toInt().coerceAtLeast(1)
-        var s = 0
-        var ci = 0
-        val t0 = System.currentTimeMillis()
-        while (s < frames) {
-            job.check()
-            for (j in 0 until chunk) {
-                val src = s - trim + j
-                if (src in 0 until frames) {
-                    inL[j] = mix[2 * src] / 32768f; inR[j] = mix[2 * src + 1] / 32768f
-                } else { inL[j] = 0f; inR[j] = 0f }
-            }
-            stft.forward(inL, inR, spec)
-            infer(spec, pred)
-            if (quality.denoise) {
-                for (i in spec.indices) spec[i] = -spec[i]
-                infer(spec, neg)
-                for (i in pred.indices) pred[i] = 0.5f * (pred[i] - neg[i])
-            }
-            stft.inverse(pred, outL, outR)
-            for (i in 0 until gen) {
-                segL[i] = outL[trim + i] * taper[i]; segR[i] = outR[trim + i] * taper[i]
-            }
-            acc.add(s.toLong(), segL, segR, taper, gen)
-            ci++
-            val elapsed = (System.currentTimeMillis() - t0) / 1000
-            val eta = if (ci > 0) elapsed * (total - ci) / ci else 0L
-            job.progress("Нейросеть: блок $ci из $total · осталось ~${eta / 60}:${"%02d".format(eta % 60)}", p0 + (p1 - p0) * ci / total)
-            s += step
+    /** Открытие сессии: сохранённый результат калибровки или CPU (калибровка — на первом блоке). */
+    fun open(job: JobScope): Boolean {
+        val cached = if (accelerate) AccelStore.get(ctx, model.name) else null
+        if (cached != null && cached.backend != Backend.CPU) {
+            job.update("Запуск: ${cached.backend.label}…", 0.1f)
+            AccelStore.markPending(ctx, model.name, cached.backend)
+            // Метка «pending» снимается в close(): если драйвер ускорителя уронит процесс,
+            // при следующем запуске этот бэкенд будет исключён автоматически
+            val s = runCatching { SessionFactory.create(env, modelFile, cached.backend) }.getOrNull()
+            if (s != null) { bind(s, cached.backend); return false }
+            AccelStore.clearPending(ctx, model.name)
+            AccelStore.reset(ctx, model.name)
         }
-        acc.finish()
+        job.update("Загрузка нейросети…", 0.1f)
+        bind(SessionFactory.create(env, modelFile, Backend.CPU), Backend.CPU)
+        return accelerate && cached == null // нужна калибровка
     }
 
-    override fun close() { session.close() }
+    private fun snrDb(ref: FloatArray, x: FloatArray): Double {
+        var num = 0.0; var den = 0.0
+        for (i in ref.indices) { val r = ref[i].toDouble(); val d = r - x[i]; num += r * r; den += d * d }
+        return if (den <= 1e-30) 200.0 else 10 * kotlin.math.log10(num / den)
+    }
+
+    /**
+     * Калибровка на реальном первом блоке песни: эталон — CPU FP32. Каждый ускоритель
+     * проверяется по точности (SNR ≥ 42 дБ, т. е. отличие не слышно) и скорости, выбирается быстрейший.
+     * Результат запоминается — при следующих разделениях калибровки нет.
+     */
+    private fun calibrate(spec: FloatArray, cpuOut: FloatArray, cpuSec: Double, job: JobScope) {
+        AccelStore.putCpu(ctx, model.name, cpuSec)
+        var best = AccelResult(Backend.CPU, cpuSec, null)
+        var bestSession: OrtSession? = null
+        val crashed = AccelStore.crashed(ctx, model.name)
+        val tmp = FloatArray(cpuOut.size)
+        for (b in listOf(Backend.NNAPI_FP16, Backend.NNAPI_FP32, Backend.XNNPACK)) {
+            if (b in crashed) continue
+            job.update("Калибровка ускорителя: ${b.label}…", 0.12f)
+            AccelStore.markPending(ctx, model.name, b)
+            val s = runCatching { SessionFactory.create(env, modelFile, b) }.getOrNull()
+            if (s == null) { AccelStore.clearPending(ctx, model.name); continue }
+            val r = runCatching {
+                val name = s.inputNames.first()
+                var t = System.nanoTime()
+                infer(s, name, dimF, dimT, spec, tmp)
+                var sec = (System.nanoTime() - t) / 1e9
+                if (sec < best.secondsPerPass) { // повторный прогон без «прогрева»
+                    t = System.nanoTime(); infer(s, name, dimF, dimT, spec, tmp); sec = minOf(sec, (System.nanoTime() - t) / 1e9)
+                }
+                sec to snrDb(cpuOut, tmp)
+            }.getOrNull()
+            AccelStore.clearPending(ctx, model.name)
+            if (r != null && r.second >= 42.0 && r.first < best.secondsPerPass * 0.9) {
+                bestSession?.close()
+                bestSession = s
+                best = AccelResult(b, r.first, r.second)
+            } else s.close()
+        }
+        AccelStore.put(ctx, model.name, best)
+        if (bestSession != null) {
+            bind(bestSession, best.backend)
+            AccelStore.markPending(ctx, model.name, best.backend)
+        }
+    }
+
+    suspend fun process(mix: ShortArray, frames: Int, quality: SepQuality, needCalibration: Boolean, job: JobScope, p0: Float, p1: Float, sink: StemSink) =
+        coroutineScope {
+            val chunk = hop * (dimT - 1)
+            val trim = nFft / 2
+            val gen = chunk - 2 * trim
+            require(gen > 0) { "Неверные параметры модели" }
+            val step = max(hop, (gen * (1f - quality.overlap)).toInt())
+            val ramp = gen - step
+            val taper = FloatArray(gen) { i ->
+                when {
+                    ramp <= 0 -> 1f
+                    i < ramp -> (0.5 - 0.5 * cos(PI * (i + 0.5) / ramp)).toFloat().coerceAtLeast(1e-3f)
+                    i >= gen - ramp -> (0.5 - 0.5 * cos(PI * (gen - i - 0.5) / ramp)).toFloat().coerceAtLeast(1e-3f)
+                    else -> 1f
+                }
+            }
+            val fwd = MdxStft(nFft, hop, dimF, dimT)   // для подготовки следующего блока (параллельно)
+            val inv = MdxStft(nFft, hop, dimF, dimT)   // для синтеза текущего
+            val plane = dimF * dimT
+            val specs = arrayOf(FloatArray(4 * plane), FloatArray(4 * plane))
+            val pred = FloatArray(4 * plane)
+            val neg = if (quality.denoise) FloatArray(4 * plane) else FloatArray(0)
+            val inL = FloatArray(chunk); val inR = FloatArray(chunk)
+            val outL = FloatArray(chunk); val outR = FloatArray(chunk)
+            val segL = FloatArray(gen); val segR = FloatArray(gen)
+
+            /** Чтение блока и STFT. Возвращает true, если блок — тишина (нейросеть не нужна). */
+            fun prepare(s: Int, out: FloatArray): Boolean {
+                var peak = 0
+                for (j in 0 until chunk) {
+                    val src = s - trim + j
+                    if (src in 0 until frames) {
+                        val a = mix[2 * src].toInt(); val b = mix[2 * src + 1].toInt()
+                        inL[j] = a / 32768f; inR[j] = b / 32768f
+                        val m = maxOf(kotlin.math.abs(a), kotlin.math.abs(b)); if (m > peak) peak = m
+                    } else { inL[j] = 0f; inR[j] = 0f }
+                }
+                if (peak < 4) return true
+                fwd.forward(inL, inR, out)
+                return false
+            }
+
+            val starts = generateSequence(0) { it + step }.takeWhile { it < frames }.toList().ifEmpty { listOf(0) }
+            val total = starts.size
+            val acc = OverlapAccumulator(gen, frames.toLong(), 0L, sink)
+            var cur = 0
+            var curSilent = prepare(starts[0], specs[0])
+            val t0 = System.currentTimeMillis()
+            var needCal = needCalibration
+
+            for (ci in starts.indices) {
+                job.check()
+                // Пока нейросеть считает текущий блок — готовим следующий на другом ядре
+                val next = if (ci + 1 < total) {
+                    val buf = specs[1 - cur]; val st = starts[ci + 1]
+                    async(Dispatchers.Default) { prepare(st, buf) }
+                } else null
+                val spec = specs[cur]
+                if (curSilent) {
+                    pred.fill(0f)
+                } else {
+                    if (needCal) {
+                        job.update("Калибровка: эталон на CPU…", 0.11f)
+                        val t = System.nanoTime()
+                        infer(spec, pred)
+                        calibrate(spec, pred, (System.nanoTime() - t) / 1e9, job)
+                        needCal = false
+                    } else infer(spec, pred)
+                    if (quality.denoise) {
+                        for (i in spec.indices) spec[i] = -spec[i]
+                        infer(spec, neg)
+                        for (i in pred.indices) pred[i] = 0.5f * (pred[i] - neg[i])
+                    }
+                }
+                if (curSilent) { outL.fill(0f); outR.fill(0f) } else inv.inverse(pred, outL, outR)
+                for (i in 0 until gen) {
+                    segL[i] = outL[trim + i] * taper[i]; segR[i] = outR[trim + i] * taper[i]
+                }
+                acc.add(starts[ci].toLong(), segL, segR, taper, gen)
+                curSilent = next?.await() ?: false
+                cur = 1 - cur
+                val done = ci + 1
+                val elapsed = (System.currentTimeMillis() - t0) / 1000
+                val eta = elapsed * (total - done) / done
+                job.progress(
+                    "${backend.short}: блок $done из $total · осталось ~${eta / 60}:${"%02d".format(eta % 60)}",
+                    p0 + (p1 - p0) * done / total
+                )
+            }
+            acc.finish()
+        }
+
+    override fun close() {
+        session?.close(); session = null
+        if (backend != Backend.CPU) AccelStore.clearPending(ctx, model.name)
+    }
 }
 
 // ===================================================================================
@@ -337,8 +456,9 @@ object Separator {
             if (opt.model != null) {
                 job.progress("Загрузка нейросети…", 0.1f)
                 val file = ModelManager.file(ctx, opt.model)
-                MdxEngine(file, opt.model.nFft).use { eng ->
-                    eng.process(mix, frames, opt.quality, job, 0.1f, 0.92f, sink)
+                MdxEngine(ctx, opt.model, file, opt.accelerate).use { eng ->
+                    val needCal = eng.open(job)
+                    eng.process(mix, frames, opt.quality, needCal, job, 0.13f, 0.92f, sink)
                 }
             } else {
                 DspEngine.process(mix, frames, RATE, opt.dspStrength, job, 0.1f, 0.92f, sink)
@@ -367,15 +487,19 @@ object Separator {
         return results
     }
 
-    /** Оценка времени (сек) — грубо, для подсказки в интерфейсе. */
-    fun estimateSeconds(durationMs: Long, opt: SepOptions): Long {
+    /** Оценка времени (сек) по замеру скорости устройства. */
+    fun estimateSeconds(ctx: Context, durationMs: Long, opt: SepOptions): Long {
         val sec = durationMs / 1000.0
-        val k = when {
-            opt.model == null -> 0.05
-            opt.quality == SepQuality.FAST -> 0.35
-            opt.quality == SepQuality.BALANCED -> 0.7
-            else -> 2.8
-        }
-        return (sec * k).toLong().coerceAtLeast(3)
+        val m = opt.model ?: return (sec * 0.05).toLong().coerceAtLeast(3)
+        val gen = 1024 * 255 - m.nFft
+        val step = gen * (1f - opt.quality.overlap)
+        val chunks = kotlin.math.ceil(sec * RATE / step)
+        val passes = if (opt.quality.denoise) 2 else 1
+        val perPass = (if (opt.accelerate) AccelStore.get(ctx, m.name)?.secondsPerPass else null)
+            ?: AccelStore.cpuSeconds(ctx, m.name) ?: 10.0
+        return (chunks * passes * perPass + 5).toLong()
     }
+
+    fun calibrationInfo(ctx: Context, m: ModelInfo): AccelResult? = AccelStore.get(ctx, m.name)
+    fun resetCalibration(ctx: Context, m: ModelInfo) = AccelStore.reset(ctx, m.name)
 }

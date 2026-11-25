@@ -94,7 +94,7 @@ class PlayerConnection(private val context: Context) {
                 if (c != null && c.isPlaying) {
                     _state.value = _state.value.copy(positionMs = c.currentPosition, durationMs = c.duration.coerceAtLeast(0))
                 }
-                delay(200)
+                delay(100)
             }
         }
     }

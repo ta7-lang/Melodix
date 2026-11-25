@@ -69,6 +69,9 @@ fun NowPlayingScreen(vm: AppViewModel, nav: NavHostController) {
     val accent by animateColorAsState(accentTarget, tween(700), label = "acc")
 
     var showQueue by remember { mutableStateOf(false) }
+    var showLyrics by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
+    val allTracks by vm.allTracks.collectAsStateWithLifecycle()
+    val currentTrack = remember(s.mediaId, allTracks) { allTracks.firstOrNull { it.key == s.mediaId } }
     var showSpeed by remember { mutableStateOf(false) }
     var showSleep by remember { mutableStateOf(false) }
     val onBg = if (visuals.settings.adaptPlayerToCover && coverPalette != null) Color.White else cs.onBackground
@@ -93,31 +96,43 @@ fun NowPlayingScreen(vm: AppViewModel, nav: NavHostController) {
             val scale by animateFloatAsState(if (s.isPlaying) 1f else 0.86f, spring(dampingRatio = 0.55f, stiffness = Spring.StiffnessLow), label = "art")
             var dragX by remember { mutableFloatStateOf(0f) }
             val dragAnim by animateFloatAsState(dragX, spring(stiffness = Spring.StiffnessMediumLow), label = "drag")
-            AnimatedContent(
-                targetState = s.mediaId,
-                transitionSpec = {
-                    (fadeIn(tween(380)) + slideInHorizontally(tween(380)) { it / 5 }) togetherWith (fadeOut(tween(250)) + slideOutHorizontally(tween(300)) { -it / 5 })
-                },
-                label = "cover",
-            ) { _ ->
-                ArtworkImage(
-                    s.uri,
-                    Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(1f)
-                        .graphicsLayer { scaleX = scale; scaleY = scale; translationX = dragAnim; rotationZ = dragAnim / 60f }
-                        .shadow(28.dp, RoundedCornerShape(36.dp), ambientColor = accent, spotColor = accent)
-                        .pointerInput(Unit) {
-                            detectHorizontalDragGestures(
-                                onDragEnd = {
-                                    if (dragX < -160) vm.player.next() else if (dragX > 160) vm.player.previous()
-                                    dragX = 0f
-                                },
-                                onDragCancel = { dragX = 0f },
-                            ) { _, d -> dragX += d }
+            Box(Modifier.fillMaxWidth().aspectRatio(1f)) {
+                AnimatedContent(
+                    targetState = showLyrics,
+                    transitionSpec = { (fadeIn(tween(400)) + androidx.compose.animation.scaleIn(tween(400), initialScale = 0.94f)) togetherWith fadeOut(tween(250)) },
+                    label = "lyr",
+                ) { lyr ->
+                    if (lyr) {
+                        LyricsPanel(currentTrack, s.positionMs, accent, onBg, onSeek = { vm.player.seekTo(it) }, modifier = Modifier.fillMaxSize())
+                    } else {
+                    AnimatedContent(
+                        targetState = s.mediaId,
+                        transitionSpec = {
+                            (fadeIn(tween(380)) + slideInHorizontally(tween(380)) { it / 5 }) togetherWith (fadeOut(tween(250)) + slideOutHorizontally(tween(300)) { -it / 5 })
                         },
-                    RoundedCornerShape(36.dp), 900,
-                )
+                        label = "cover",
+                    ) { _ ->
+                        ArtworkImage(
+                            s.uri,
+                            Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(1f)
+                                .graphicsLayer { scaleX = scale; scaleY = scale; translationX = dragAnim; rotationZ = dragAnim / 60f }
+                                .shadow(28.dp, RoundedCornerShape(36.dp), ambientColor = accent, spotColor = accent)
+                                .pointerInput(Unit) {
+                                    detectHorizontalDragGestures(
+                                        onDragEnd = {
+                                            if (dragX < -160) vm.player.next() else if (dragX > 160) vm.player.previous()
+                                            dragX = 0f
+                                        },
+                                        onDragCancel = { dragX = 0f },
+                                    ) { _, d -> dragX += d }
+                                },
+                            RoundedCornerShape(36.dp), 900,
+                        )
+                    }
+                    }
+                }
             }
 
             Spacer(Modifier.weight(0.5f))
@@ -170,10 +185,10 @@ fun NowPlayingScreen(vm: AppViewModel, nav: NavHostController) {
                 val key = s.mediaId
                 ToolIcon(Icons.Rounded.Speed, if (s.speed != 1f || s.pitch != 1f) "%.2fx".format(s.speed) else "Скорость", onBg) { showSpeed = true }
                 ToolIcon(Icons.Rounded.Timer, if (sleepLeft > 0) formatTime(sleepLeft) else "Таймер", onBg) { showSleep = true }
+                ToolIcon(Icons.Rounded.FormatQuote, if (showLyrics) "Обложка" else "Текст", if (showLyrics) accent else onBg) { showLyrics = !showLyrics }
                 ToolIcon(Icons.Rounded.Equalizer, "Эквалайзер", onBg) { nav.navigate(Routes.EQ) { launchSingleTop = true } }
                 ToolIcon(Icons.Rounded.ContentCut, "Обрезка", onBg) { if (key != null) nav.navigate(Routes.editor(key)) }
                 ToolIcon(Icons.Rounded.GraphicEq, "Стемы", onBg) { if (key != null) nav.navigate(Routes.separate(key)) }
-                ToolIcon(Icons.Rounded.Edit, "Теги", onBg) { if (key != null) nav.navigate(Routes.tags(key)) }
             }
             Spacer(Modifier.height(12.dp))
         }

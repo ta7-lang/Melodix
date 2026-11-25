@@ -74,7 +74,7 @@ fun TagEditorScreen(vm: AppViewModel, track: Track, nav: NavHostController) {
             saving = false
             when (r) {
                 is SaveResult.Ok -> {
-                    ArtworkLoader.invalidate(); vm.refreshLibrary()
+                    ArtworkLoader.invalidate(); com.melodix.app.data.LyricsRepository.invalidate(track); vm.refreshLibrary()
                     data = d.copy(artworkChanged = false)
                     snackbar.showSnackbar("Теги сохранены")
                 }

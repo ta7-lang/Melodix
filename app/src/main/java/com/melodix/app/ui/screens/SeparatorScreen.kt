@@ -57,11 +57,13 @@ fun SeparatorScreen(vm: AppViewModel, track: Track, nav: NavHostController) {
     var quality by remember { mutableStateOf(SepQuality.BALANCED) }
     var format by remember { mutableStateOf(ExportFormat.WAV) }
     var strength by remember { mutableFloatStateOf(0.7f) }
+    var accelerate by remember { mutableStateOf(true) }
+    var calVersion by remember { mutableIntStateOf(0) }
     var importUri by remember { mutableStateOf<Uri?>(null) }
 
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> importUri = uri }
 
-    val options = SepOptions(model = if (useDsp) null else selected, quality = quality, format = format, dspStrength = strength)
+    val options = SepOptions(model = if (useDsp) null else selected, quality = quality, format = format, dspStrength = strength, accelerate = accelerate)
     val busy = job?.done == false
 
     Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().verticalScroll(rememberScrollState())) {
@@ -115,6 +117,28 @@ fun SeparatorScreen(vm: AppViewModel, track: Track, nav: NavHostController) {
                         }
                     }
                     Text(quality.description, style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
+                    Spacer(Modifier.height(12.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Аппаратное ускорение (NPU)", style = MaterialTheme.typography.titleSmall)
+                            val cal = remember(selected, calVersion, job?.done) { selected?.let { Separator.calibrationInfo(ctx, it) } }
+                            Text(
+                                when {
+                                    !accelerate -> "Только процессор, FP32"
+                                    cal == null -> "При первом запуске приложение само выберет самый быстрый вычислитель и проверит точность"
+                                    else -> "${cal.backend.label} · ${"%.1f".format(cal.secondsPerPass)} с на блок" +
+                                        (cal.snrDb?.let { " · точность ${"%.0f".format(it)} дБ" } ?: "")
+                                },
+                                style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant,
+                            )
+                        }
+                        Switch(accelerate, { accelerate = it })
+                    }
+                    if (accelerate && selected != null) {
+                        TextButton(onClick = { selected?.let { Separator.resetCalibration(ctx, it) }; calVersion++ }, enabled = !busy) {
+                            Text("Перекалибровать ускоритель")
+                        }
+                    }
                 } else {
                     LabeledSlider("Строгость выделения вокала", strength * 100, 0f..100f, "%") { strength = it / 100f }
                 }
@@ -125,7 +149,7 @@ fun SeparatorScreen(vm: AppViewModel, track: Track, nav: NavHostController) {
                         SegmentedButton(format == f, { format = f }, SegmentedButtonDefaults.itemShape(i, ExportFormat.entries.size)) { Text(f.label) }
                     }
                 }
-                Text("Ориентировочно: ~${formatTime(Separator.estimateSeconds(track.durationMs, options) * 1000)} (зависит от процессора)",
+                Text("Ориентировочно: ~${formatTime(Separator.estimateSeconds(ctx, track.durationMs, options) * 1000)} (зависит от процессора)",
                     style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
                 Spacer(Modifier.height(14.dp))
                 Button(
